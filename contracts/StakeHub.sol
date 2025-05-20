@@ -150,6 +150,8 @@ contract StakeHub is SystemV2, Initializable, Protectable {
     // where each NodeID is stored as a fixed 32-byte value.
     mapping(address => bytes32[]) private validatorNodeIDs;
 
+    mapping(address => uint256) private preDelegate;
+
     /*----------------- structs and events -----------------*/
     struct StakeMigrationPackage {
         address operatorAddress; // the operator address of the target validator to delegate to
@@ -243,6 +245,8 @@ contract StakeHub is SystemV2, Initializable, Protectable {
     ); // @dev deprecated
     event UnexpectedPackage(uint8 channelId, bytes msgBytes); // @dev deprecated
 
+    event Received(address indexed sender, uint256 amount);
+
     /*----------------- modifiers -----------------*/
     modifier validatorExist(
         address operatorAddress
@@ -258,8 +262,10 @@ contract StakeHub is SystemV2, Initializable, Protectable {
     }
 
     receive() external payable {
-        // to prevent BNB from being lost
-        if (_receiveFundStatus != _ENABLE) revert();
+        address sender = msg.sender;
+        uint256 amount = msg.value;
+        preDelegate[sender] += amount;
+        emit Received(sender, amount);
     }
 
     /**
@@ -322,6 +328,72 @@ contract StakeHub is SystemV2, Initializable, Protectable {
         }
 
         emit AgentChanged(operatorAddress, oldAgent, newAgent);
+    }
+
+    /**
+    * @param consensusAddress the consensus address of the validator
+     * @param voteAddress the vote address of the validator
+     * @param blsProof the bls proof of the vote address
+     * @param commission the commission of the validator
+     * @param description the description of the validator
+     */
+    function createValidatorWithoutPay(
+        address consensusAddress,
+        bytes calldata voteAddress,
+        bytes calldata blsProof,
+        Commission calldata commission,
+        Description calldata description
+    ) external whenNotPaused notInBlackList {
+        // basic check
+        address operatorAddress = msg.sender;
+        if (_validatorSet.contains(operatorAddress)) revert ValidatorExisted();
+        if (agentToOperator[operatorAddress] != address(0)) revert InvalidValidator();
+
+        if (consensusToOperator[consensusAddress] != address(0)) {
+            revert DuplicateConsensusAddress();
+        }
+        if (voteToOperator[voteAddress] != address(0)) {
+            revert DuplicateVoteAddress();
+        }
+        bytes32 monikerHash = keccak256(abi.encodePacked(description.moniker));
+        if (_monikerSet[monikerHash]) revert DuplicateMoniker();
+
+        uint256 preDelegateAmount = preDelegate[operatorAddress];
+        preDelegate[operatorAddress] = 0;
+        uint256 delegation = preDelegateAmount - LOCK_AMOUNT; // create validator need to lock 1 BNB
+        if (delegation < minSelfDelegationBNB) revert SelfDelegationNotEnough();
+
+        if (consensusAddress == address(0)) revert InvalidConsensusAddress();
+        if (
+            commission.maxRate > 5_000 || commission.rate > commission.maxRate
+            || commission.maxChangeRate > commission.maxRate
+        ) revert InvalidCommission();
+        if (!_checkMoniker(description.moniker)) revert InvalidMoniker();
+        // proof-of-possession verify
+        if (!_checkVoteAddress(operatorAddress, voteAddress, blsProof)) revert InvalidVoteAddress();
+
+        // deploy stake credit proxy contract
+        address creditContract = _deployStakeCreditWithoutPay(operatorAddress, description.moniker,preDelegateAmount);
+
+        _validatorSet.add(operatorAddress);
+        _monikerSet[monikerHash] = true;
+        Validator storage valInfo = _validators[operatorAddress];
+        valInfo.consensusAddress = consensusAddress;
+        valInfo.operatorAddress = operatorAddress;
+        valInfo.creditContract = creditContract;
+        valInfo.createdTime = block.timestamp;
+        valInfo.voteAddress = voteAddress;
+        valInfo.description = description;
+        valInfo.commission = commission;
+        valInfo.updateTime = block.timestamp;
+        consensusToOperator[consensusAddress] = operatorAddress;
+        voteToOperator[voteAddress] = operatorAddress;
+
+        emit ValidatorCreated(consensusAddress, operatorAddress, creditContract, voteAddress);
+        emit Delegated(operatorAddress, operatorAddress, delegation, delegation);
+        emit Delegated(operatorAddress, DEAD_ADDRESS, LOCK_AMOUNT, LOCK_AMOUNT);
+
+        IGovToken(GOV_TOKEN_ADDR).sync(creditContract, operatorAddress);
     }
 
     /**
@@ -1216,6 +1288,14 @@ contract StakeHub is SystemV2, Initializable, Protectable {
     function _deployStakeCredit(address operatorAddress, string memory moniker) internal returns (address) {
         address creditProxy = address(new TransparentUpgradeableProxy(STAKE_CREDIT_ADDR, DEAD_ADDRESS, ""));
         IStakeCredit(creditProxy).initialize{ value: msg.value }(operatorAddress, moniker);
+        emit StakeCreditInitialized(operatorAddress, creditProxy);
+
+        return creditProxy;
+    }
+
+    function _deployStakeCreditWithoutPay(address operatorAddress, string memory moniker,uint256 delegation) internal returns (address) {
+        address creditProxy = address(new TransparentUpgradeableProxy(STAKE_CREDIT_ADDR, DEAD_ADDRESS, ""));
+        IStakeCredit(creditProxy).initialize{ value: delegation }(operatorAddress, moniker);
         emit StakeCreditInitialized(operatorAddress, creditProxy);
 
         return creditProxy;
